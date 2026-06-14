@@ -1,0 +1,100 @@
+name: Publish Runtime Manifest
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 7 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  BUN_VERSION: '1.2.23'
+  ARROXY_REPO_PATH: Arroxy
+  RUNTIME_MANIFEST_DIR: dist/runtime-binaries
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out Arroxy
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          repository: antonio-orionus/Arroxy
+          path: ${{ env.ARROXY_REPO_PATH }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '22'
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install Arroxy dependencies
+        working-directory: ${{ env.ARROXY_REPO_PATH }}
+        run: bun install --frozen-lockfile
+
+      - name: Generate runtime manifest
+        working-directory: ${{ env.ARROXY_REPO_PATH }}
+        run: bun scripts/build/runtimeBinaryManifest.ts generate --out "$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.json" --cache-root "$RUNNER_TEMP/arroxy-runtime-binary-manifest" --validate
+
+      - name: Sign runtime manifest
+        working-directory: ${{ env.ARROXY_REPO_PATH }}
+        env:
+          ARROXY_RUNTIME_INDEX_SIGNING_KEY: ${{ secrets.ARROXY_RUNTIME_INDEX_SIGNING_KEY }}
+        run: bun scripts/build/runtimeBinaryManifest.ts sign --manifest "$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.json" --out "$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.sig"
+
+      - name: Validate signed runtime manifest
+        working-directory: ${{ env.ARROXY_REPO_PATH }}
+        run: bun scripts/build/runtimeBinaryManifest.ts validate --manifest "$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.json" --cache-root "$RUNNER_TEMP/arroxy-runtime-binary-manifest" --smoke current
+
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          repo="$GITHUB_REPOSITORY"
+          tag="runtime-$(date -u +'%Y.%m.%d.%H%M%S')"
+          manifest="$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.json"
+          signature="$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.sig"
+          notes="Signed runtime binary manifest for Arroxy. The desktop app verifies runtime-index-v1.sig before trusting runtime-index-v1.json."
+
+          test -s "$manifest"
+          test -s "$signature"
+
+          gh release create "$tag" \
+            "$manifest" \
+            "$signature" \
+            --repo "$repo" \
+            --target "$GITHUB_SHA" \
+            --draft \
+            --title "Arroxy runtime manifest $tag" \
+            --notes "$notes"
+
+          asset_names="$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name')"
+          printf '%s\n' "$asset_names" | grep -Fx 'runtime-index-v1.json' >/dev/null
+          printf '%s\n' "$asset_names" | grep -Fx 'runtime-index-v1.sig' >/dev/null
+          asset_count="$(printf '%s\n' "$asset_names" | sed '/^$/d' | wc -l | tr -d ' ')"
+          if [ "$asset_count" != "2" ]; then
+            echo "Expected exactly 2 release assets, got $asset_count:"
+            printf '%s\n' "$asset_names"
+            exit 1
+          fi
+
+          gh release edit "$tag" --repo "$repo" --draft=false
+
+          {
+            echo "Published $tag"
+            echo
+            echo "- runtime-index-v1.json"
+            echo "- runtime-index-v1.sig"
+          } >> "$GITHUB_STEP_SUMMARY"
