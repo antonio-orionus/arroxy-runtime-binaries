@@ -44,6 +44,8 @@ jobs:
 
       - name: Generate runtime manifest
         working-directory: ${{ env.ARROXY_REPO_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bun scripts/build/runtimeBinaryManifest.ts generate --out "$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.json" --cache-root "$RUNNER_TEMP/arroxy-runtime-binary-manifest" --validate
 
       - name: Sign runtime manifest
