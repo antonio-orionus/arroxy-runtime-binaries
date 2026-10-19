@@ -2,6 +2,11 @@ name: Publish Runtime Manifest
 
 on:
   workflow_dispatch:
+    inputs:
+      arroxy_ref:
+        description: Arroxy branch, tag or commit to generate the manifests from
+        required: false
+        default: main
   schedule:
     - cron: '17 7 * * *'
 
@@ -27,6 +32,7 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           repository: antonio-orionus/Arroxy
+          ref: ${{ inputs.arroxy_ref || 'main' }}
           path: ${{ env.ARROXY_REPO_PATH }}
           persist-credentials: false
 
@@ -42,19 +48,34 @@ jobs:
         working-directory: ${{ env.ARROXY_REPO_PATH }}
         run: bun install --frozen-lockfile
 
-      - name: Generate runtime manifest
+      # Arroxy versions with FFmpeg packages also write runtime-index-v2.json
+      # next to v1. Older ones write v1 only; both are published as found.
+      - name: Generate runtime manifests
         working-directory: ${{ env.ARROXY_REPO_PATH }}
         run: bun scripts/build/runtimeBinaryManifest.ts generate --out "$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.json" --cache-root "$RUNNER_TEMP/arroxy-runtime-binary-manifest" --validate
 
-      - name: Sign runtime manifest
+      - name: Sign runtime manifests
         working-directory: ${{ env.ARROXY_REPO_PATH }}
         env:
           ARROXY_RUNTIME_INDEX_SIGNING_KEY: ${{ secrets.ARROXY_RUNTIME_INDEX_SIGNING_KEY }}
-        run: bun scripts/build/runtimeBinaryManifest.ts sign --manifest "$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.json" --out "$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.sig"
+        run: |
+          set -euo pipefail
+          dir="$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR"
+          bun scripts/build/runtimeBinaryManifest.ts sign --manifest "$dir/runtime-index-v1.json" --out "$dir/runtime-index-v1.sig"
+          if [ -f "$dir/runtime-index-v2.json" ]; then
+            bun scripts/build/runtimeBinaryManifest.ts sign --manifest "$dir/runtime-index-v2.json" --out "$dir/runtime-index-v2.sig"
+          fi
 
-      - name: Validate signed runtime manifest
+      # v2 validation installs and runs this host's FFmpeg package.
+      - name: Validate signed runtime manifests
         working-directory: ${{ env.ARROXY_REPO_PATH }}
-        run: bun scripts/build/runtimeBinaryManifest.ts validate --manifest "$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.json" --cache-root "$RUNNER_TEMP/arroxy-runtime-binary-manifest" --smoke current
+        run: |
+          set -euo pipefail
+          dir="$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR"
+          bun scripts/build/runtimeBinaryManifest.ts validate --manifest "$dir/runtime-index-v1.json" --cache-root "$RUNNER_TEMP/arroxy-runtime-binary-manifest" --smoke current
+          if [ -f "$dir/runtime-index-v2.json" ]; then
+            bun scripts/build/runtimeBinaryManifest.ts validate --manifest "$dir/runtime-index-v2.json" --cache-root "$RUNNER_TEMP/arroxy-runtime-binary-manifest" --smoke current
+          fi
 
       - name: Create and verify draft release
         id: draft-release
@@ -65,16 +86,21 @@ jobs:
 
           repo="$GITHUB_REPOSITORY"
           tag="runtime-$(date -u +'%Y.%m.%d.%H%M%S')"
-          manifest="$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.json"
-          signature="$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.sig"
-          notes="Signed runtime binary manifest for Arroxy. The desktop app verifies runtime-index-v1.sig before trusting runtime-index-v1.json."
+          dir="$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR"
+          expected=(runtime-index-v1.json runtime-index-v1.sig)
+          if [ -f "$dir/runtime-index-v2.json" ]; then
+            expected+=(runtime-index-v2.json runtime-index-v2.sig)
+          fi
+          notes="Signed runtime binary manifests for Arroxy. The desktop app verifies each runtime-index-v*.sig before trusting the matching runtime-index-v*.json."
 
-          test -s "$manifest"
-          test -s "$signature"
+          assets=()
+          for name in "${expected[@]}"; do
+            test -s "$dir/$name"
+            assets+=("$dir/$name")
+          done
 
           gh release create "$tag" \
-            "$manifest" \
-            "$signature" \
+            "${assets[@]}" \
             --repo "$repo" \
             --target "$GITHUB_SHA" \
             --draft \
@@ -82,30 +108,33 @@ jobs:
             --notes "$notes"
 
           asset_names="$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name')"
-          printf '%s\n' "$asset_names" | grep -Fx 'runtime-index-v1.json' >/dev/null
-          printf '%s\n' "$asset_names" | grep -Fx 'runtime-index-v1.sig' >/dev/null
+          for name in "${expected[@]}"; do
+            printf '%s\n' "$asset_names" | grep -Fx "$name" >/dev/null
+          done
           asset_count="$(printf '%s\n' "$asset_names" | sed '/^$/d' | wc -l | tr -d ' ')"
-          if [ "$asset_count" != "2" ]; then
-            echo "Expected exactly 2 release assets, got $asset_count:"
+          if [ "$asset_count" != "${#expected[@]}" ]; then
+            echo "Expected exactly ${#expected[@]} release assets, got $asset_count:"
             printf '%s\n' "$asset_names"
             exit 1
           fi
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "assets=${expected[*]}" >> "$GITHUB_OUTPUT"
 
       - name: Publish immutable release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.draft-release.outputs.tag }}
+          ASSETS: ${{ steps.draft-release.outputs.assets }}
         run: |
           set -euo pipefail
 
-          repo="$GITHUB_REPOSITORY"
-          tag="${{ steps.draft-release.outputs.tag }}"
-          gh release edit "$tag" --repo "$repo" --draft=false
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
 
           {
-            echo "Published $tag"
+            echo "Published $TAG"
             echo
-            echo "- runtime-index-v1.json"
-            echo "- runtime-index-v1.sig"
+            for name in $ASSETS; do
+              echo "- $name"
+            done
           } >> "$GITHUB_STEP_SUMMARY"
