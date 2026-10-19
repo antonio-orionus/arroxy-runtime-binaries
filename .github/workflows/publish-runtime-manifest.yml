@@ -52,6 +52,8 @@ jobs:
       # next to v1. Older ones write v1 only; both are published as found.
       - name: Generate runtime manifests
         working-directory: ${{ env.ARROXY_REPO_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bun scripts/build/runtimeBinaryManifest.ts generate --out "$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.json" --cache-root "$RUNNER_TEMP/arroxy-runtime-binary-manifest" --validate
 
       - name: Sign runtime manifests
