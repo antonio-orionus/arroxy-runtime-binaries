@@ -1,10 +1,20 @@
 name: Publish Runtime Manifest
 
+# Four jobs, each with the least it needs:
+#   plan     - resolves the Arroxy commit and decides draft vs. published.
+#   generate - runs Arroxy's generator and validator (Arroxy code and its whole
+#              dependency tree) with a read-only token and no secrets.
+#   sign     - signs with openssl only; never checks out or runs Arroxy code.
+#   publish  - the only job with contents: write; uploads, publishes, and
+#              checks that the new release is what /releases/latest serves.
+# Only a run of this repo's main against Arroxy main publishes. Anything else
+# leaves a draft release, which /releases/latest never serves.
+
 on:
   workflow_dispatch:
     inputs:
       arroxy_ref:
-        description: Arroxy branch, tag or commit to generate the manifests from
+        description: Arroxy branch, tag or commit. Anything but main creates a draft release only.
         required: false
         default: main
   schedule:
@@ -16,25 +26,90 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  BUN_VERSION: '1.2.23'
+  ARROXY_REPO: antonio-orionus/Arroxy
   ARROXY_REPO_PATH: Arroxy
   RUNTIME_MANIFEST_DIR: dist/runtime-binaries
+  RUNTIME_INDEX_FILES: runtime-index-v1.json runtime-index-v1.sig runtime-index-v2.json runtime-index-v2.sig
+  # The key Arroxy bundles in src/main/services/binary/RuntimeBinaryTrust.ts.
+  # The generate job fails when the two drift apart.
+  RUNTIME_INDEX_PUBLIC_KEY: |
+    -----BEGIN PUBLIC KEY-----
+    MCowBQYDK2VwAyEASwotnq/ABvF3TAJHHzcEIXTfbNF8hD8AzSL1oFrNGPw=
+    -----END PUBLIC KEY-----
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
-  publish:
+  plan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      arroxy_ref: ${{ steps.plan.outputs.arroxy_ref }}
+      arroxy_sha: ${{ steps.plan.outputs.arroxy_sha }}
+      draft: ${{ steps.plan.outputs.draft }}
+    steps:
+      - name: Resolve Arroxy commit and release mode
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARROXY_REF: ${{ inputs.arroxy_ref || 'main' }}
+        run: |
+          set -euo pipefail
 
+          if [ "$ARROXY_REF" = main ]; then
+            sha="$(gh api "repos/$ARROXY_REPO/branches/main" --jq .commit.sha)"
+          else
+            sha="$(gh api "repos/$ARROXY_REPO/commits/$ARROXY_REF" --jq .sha)"
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "Could not resolve Arroxy ref '$ARROXY_REF'"; exit 1; }
+
+          if [ "$ARROXY_REF" = main ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            draft=false
+          else
+            draft=true
+            echo "::notice::Arroxy ref '$ARROXY_REF' from $GITHUB_REF: creating a draft release only. Publishing needs Arroxy main and this repo's main."
+          fi
+
+          {
+            echo "arroxy_ref=$ARROXY_REF"
+            echo "arroxy_sha=$sha"
+            echo "draft=$draft"
+          } >> "$GITHUB_OUTPUT"
+
+  generate:
+    needs: plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Check out Arroxy
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
-          repository: antonio-orionus/Arroxy
-          ref: ${{ inputs.arroxy_ref || 'main' }}
+          repository: ${{ env.ARROXY_REPO }}
+          ref: ${{ needs.plan.outputs.arroxy_sha }}
           path: ${{ env.ARROXY_REPO_PATH }}
           persist-credentials: false
+
+      # Plain shell, before any Arroxy dependency is installed.
+      - name: Check Arroxy's bundled public key and Bun pin
+        id: arroxy
+        working-directory: ${{ env.ARROXY_REPO_PATH }}
+        run: |
+          set -euo pipefail
+
+          expected="$(printf '%s' "$RUNTIME_INDEX_PUBLIC_KEY" | sed -n '2p')"
+          if ! grep -Fq "$expected" src/main/services/binary/RuntimeBinaryTrust.ts; then
+            echo "Arroxy's bundled runtime index public key no longer matches RUNTIME_INDEX_PUBLIC_KEY in this workflow."
+            exit 1
+          fi
+
+          package_manager="$(jq -r '.packageManager // ""' package.json)"
+          if [[ ! "$package_manager" =~ ^bun@([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "Arroxy package.json packageManager is not a pinned bun version: '$package_manager'"
+            exit 1
+          fi
+          echo "bun_version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
@@ -42,58 +117,178 @@ jobs:
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: ${{ env.BUN_VERSION }}
+          bun-version: ${{ steps.arroxy.outputs.bun_version }}
 
       - name: Install Arroxy dependencies
         working-directory: ${{ env.ARROXY_REPO_PATH }}
         run: bun install --frozen-lockfile
 
-      # Arroxy versions with FFmpeg packages also write runtime-index-v2.json
-      # next to v1. Older ones write v1 only; both are published as found.
       - name: Generate runtime manifests
         working-directory: ${{ env.ARROXY_REPO_PATH }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: bun scripts/build/runtimeBinaryManifest.ts generate --out "$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR/runtime-index-v1.json" --cache-root "$RUNNER_TEMP/arroxy-runtime-binary-manifest" --validate
 
-      - name: Sign runtime manifests
+      # v2 validation installs and runs this host's FFmpeg package.
+      - name: Validate runtime manifests
         working-directory: ${{ env.ARROXY_REPO_PATH }}
+        run: |
+          set -euo pipefail
+          dir="$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR"
+          for version in v1 v2; do
+            test -s "$dir/runtime-index-$version.json" || { echo "Arroxy did not generate runtime-index-$version.json"; exit 1; }
+            bun scripts/build/runtimeBinaryManifest.ts validate --manifest "$dir/runtime-index-$version.json" --cache-root "$RUNNER_TEMP/arroxy-runtime-binary-manifest" --smoke current
+          done
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: runtime-manifests-unsigned
+          path: |
+            ${{ env.RUNTIME_MANIFEST_DIR }}/runtime-index-v1.json
+            ${{ env.RUNTIME_MANIFEST_DIR }}/runtime-index-v2.json
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    needs: generate
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: runtime-manifests-unsigned
+          path: ${{ env.RUNTIME_MANIFEST_DIR }}
+
+      # The generator ran third-party code, so check what is about to be
+      # signed without trusting it: the schema version, at least one entry,
+      # FFmpeg packages in v2, and every download URL a plain path (no dot
+      # segments, query or escapes) on a known source.
+      - name: Check manifest shape and download sources
+        run: |
+          set -euo pipefail
+          dir="$RUNTIME_MANIFEST_DIR"
+          allowed='[
+            "https://github.com/yt-dlp/yt-dlp/releases/download/",
+            "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/download/",
+            "https://sourceforge.net/projects/yt-dlp.mirror/files/",
+            "https://github.com/antonio-orionus/arroxy-runtime-binaries/releases/download/ffmpeg-"
+          ]'
+          for version in 1 2; do
+            file="$dir/runtime-index-v$version.json"
+            jq -e --argjson v "$version" '.schemaVersion == $v and (.entries | type == "array" and length > 0)' "$file" >/dev/null \
+              || { echo "$file is not a non-empty schemaVersion $version index"; exit 1; }
+            bad="$(jq -r --argjson allowed "$allowed" '
+              [.entries[] | .url, (.mirrors // [] | .[] | if type == "object" then .url else . end)]
+              | map(select(type != "string"
+                  or (test("^https://[A-Za-z0-9._~/+-]+$") | not)
+                  or test("/\\.\\.?(/|$)")
+                  or (. as $u | $allowed | any(. as $p | $u | startswith($p)) | not)))
+              | .[] | tostring' "$file")"
+            if [ -n "$bad" ]; then
+              echo "$file has download URLs outside the allowed sources:"
+              printf '%s\n' "$bad"
+              exit 1
+            fi
+          done
+          jq -e '[.entries[] | select(.id == "ffmpeg")] | length > 0' "$dir/runtime-index-v2.json" >/dev/null \
+            || { echo "runtime-index-v2.json has no FFmpeg packages"; exit 1; }
+
+      # Same format Arroxy verifies: an Ed25519 signature over the file's
+      # exact bytes, base64 on one line.
+      - name: Sign runtime manifests
         env:
           ARROXY_RUNTIME_INDEX_SIGNING_KEY: ${{ secrets.ARROXY_RUNTIME_INDEX_SIGNING_KEY }}
         run: |
           set -euo pipefail
-          dir="$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR"
-          bun scripts/build/runtimeBinaryManifest.ts sign --manifest "$dir/runtime-index-v1.json" --out "$dir/runtime-index-v1.sig"
-          if [ -f "$dir/runtime-index-v2.json" ]; then
-            bun scripts/build/runtimeBinaryManifest.ts sign --manifest "$dir/runtime-index-v2.json" --out "$dir/runtime-index-v2.sig"
+          umask 077
+          dir="$RUNTIME_MANIFEST_DIR"
+          key="$RUNNER_TEMP/runtime-index-signing-key.pem"
+          trap 'rm -f "$key" "$RUNNER_TEMP"/runtime-index-*.sig.bin' EXIT
+
+          secret="$(printf '%s' "$ARROXY_RUNTIME_INDEX_SIGNING_KEY" | tr -d '\r')"
+          if [ -z "$secret" ]; then
+            echo "ARROXY_RUNTIME_INDEX_SIGNING_KEY is not set"
+            exit 1
+          fi
+          # A PEM, possibly with literal \n line breaks, or a base64-encoded PEM.
+          if printf '%s' "$secret" | grep -q -- '-----BEGIN'; then
+            printf '%s\n' "$secret" | sed -e 's/\\n/\n/g' -e 's/^[[:space:]]*//' > "$key"
+          else
+            printf '%s' "$secret" | tr -d '[:space:]' | base64 -d > "$key"
           fi
 
-      # v2 validation installs and runs this host's FFmpeg package.
-      - name: Validate signed runtime manifests
-        working-directory: ${{ env.ARROXY_REPO_PATH }}
+          openssl pkey -in "$key" -pubout > "$RUNNER_TEMP/derived-public-key.pem"
+          if ! diff -q <(printf '%s\n' "$RUNTIME_INDEX_PUBLIC_KEY" | sed '/^$/d') "$RUNNER_TEMP/derived-public-key.pem" >/dev/null; then
+            echo "The signing key does not match the public key Arroxy bundles"
+            exit 1
+          fi
+
+          for version in v1 v2; do
+            bin="$RUNNER_TEMP/runtime-index-$version.sig.bin"
+            openssl pkeyutl -sign -inkey "$key" -rawin -in "$dir/runtime-index-$version.json" -out "$bin"
+            printf '%s\n' "$(base64 -w0 "$bin")" > "$dir/runtime-index-$version.sig"
+          done
+
+      - name: Verify signatures against Arroxy's public key
         run: |
           set -euo pipefail
-          dir="$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR"
-          bun scripts/build/runtimeBinaryManifest.ts validate --manifest "$dir/runtime-index-v1.json" --cache-root "$RUNNER_TEMP/arroxy-runtime-binary-manifest" --smoke current
-          if [ -f "$dir/runtime-index-v2.json" ]; then
-            bun scripts/build/runtimeBinaryManifest.ts validate --manifest "$dir/runtime-index-v2.json" --cache-root "$RUNNER_TEMP/arroxy-runtime-binary-manifest" --smoke current
+          dir="$RUNTIME_MANIFEST_DIR"
+          printf '%s\n' "$RUNTIME_INDEX_PUBLIC_KEY" > "$RUNNER_TEMP/public-key.pem"
+          for version in v1 v2; do
+            base64 -d < "$dir/runtime-index-$version.sig" > "$RUNNER_TEMP/runtime-index-$version.sig.bin"
+            openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/public-key.pem" -rawin -in "$dir/runtime-index-$version.json" -sigfile "$RUNNER_TEMP/runtime-index-$version.sig.bin"
+          done
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: runtime-manifests-signed
+          path: ${{ env.RUNTIME_MANIFEST_DIR }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [plan, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: runtime-manifests-signed
+          path: ${{ env.RUNTIME_MANIFEST_DIR }}
+
+      - name: Check the signed files
+        run: |
+          set -euo pipefail
+          dir="$RUNTIME_MANIFEST_DIR"
+          printf '%s\n' "$RUNTIME_INDEX_PUBLIC_KEY" > "$RUNNER_TEMP/public-key.pem"
+          read -r -a files <<< "$RUNTIME_INDEX_FILES"
+          actual="$(find "$dir" -mindepth 1 -printf '%f\n' | sort)"
+          expected="$(printf '%s\n' "${files[@]}" | sort)"
+          if [ "$actual" != "$expected" ]; then
+            echo "Expected exactly:"; printf '%s\n' "$expected"
+            echo "Got:"; printf '%s\n' "$actual"
+            exit 1
           fi
+          for version in v1 v2; do
+            base64 -d < "$dir/runtime-index-$version.sig" > "$RUNNER_TEMP/sig.bin"
+            openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/public-key.pem" -rawin -in "$dir/runtime-index-$version.json" -sigfile "$RUNNER_TEMP/sig.bin"
+          done
 
       - name: Create and verify draft release
         id: draft-release
         env:
           GH_TOKEN: ${{ github.token }}
+          ARROXY_REF: ${{ needs.plan.outputs.arroxy_ref }}
+          ARROXY_SHA: ${{ needs.plan.outputs.arroxy_sha }}
         run: |
           set -euo pipefail
 
           repo="$GITHUB_REPOSITORY"
           tag="runtime-$(date -u +'%Y.%m.%d.%H%M%S')"
-          dir="$GITHUB_WORKSPACE/$RUNTIME_MANIFEST_DIR"
-          expected=(runtime-index-v1.json runtime-index-v1.sig)
-          if [ -f "$dir/runtime-index-v2.json" ]; then
-            expected+=(runtime-index-v2.json runtime-index-v2.sig)
-          fi
-          notes="Signed runtime binary manifests for Arroxy. The desktop app verifies each runtime-index-v*.sig before trusting the matching runtime-index-v*.json."
+          dir="$RUNTIME_MANIFEST_DIR"
+          read -r -a expected <<< "$RUNTIME_INDEX_FILES"
+          notes="Signed runtime binary manifests for Arroxy, generated from $ARROXY_REPO@$ARROXY_SHA ($ARROXY_REF). The desktop app verifies each runtime-index-v*.sig before trusting the matching runtime-index-v*.json."
 
           assets=()
           for name in "${expected[@]}"; do
@@ -121,22 +316,74 @@ jobs:
           fi
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "assets=${expected[*]}" >> "$GITHUB_OUTPUT"
 
       - name: Publish immutable release
+        if: needs.plan.outputs.draft == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.draft-release.outputs.tag }}
-          ASSETS: ${{ steps.draft-release.outputs.assets }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+      # Arroxy reads /releases/latest/download/, so the release just published
+      # must be the one served there, byte for byte, with valid signatures.
+      # An FFmpeg package release that became latest would fail this.
+      - name: Verify the latest release serves these manifests
+        if: needs.plan.outputs.draft == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.draft-release.outputs.tag }}
         run: |
           set -euo pipefail
+          dir="$RUNTIME_MANIFEST_DIR"
+          served="$RUNNER_TEMP/served"
+          mkdir -p "$served"
+          printf '%s\n' "$RUNTIME_INDEX_PUBLIC_KEY" > "$RUNNER_TEMP/public-key.pem"
 
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          latest=""
+          for _ in 1 2 3 4 5 6; do
+            latest="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+            [ "$latest" = "$TAG" ] && break
+            sleep 10
+          done
+          if [ "$latest" != "$TAG" ]; then
+            echo "The latest release is $latest, not $TAG"
+            exit 1
+          fi
 
+          for name in $RUNTIME_INDEX_FILES; do
+            ok=false
+            for _ in 1 2 3 4 5 6; do
+              curl -fsSL --retry 3 --retry-all-errors -o "$served/$name" "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/$name" \
+                && cmp -s "$served/$name" "$dir/$name" && { ok=true; break; }
+              sleep 10
+            done
+            if [ "$ok" != true ]; then
+              echo "/releases/latest/download/$name does not serve the file just published"
+              exit 1
+            fi
+          done
+
+          for version in v1 v2; do
+            base64 -d < "$served/runtime-index-$version.sig" > "$RUNNER_TEMP/sig.bin"
+            openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/public-key.pem" -rawin -in "$served/runtime-index-$version.json" -sigfile "$RUNNER_TEMP/sig.bin"
+          done
+
+      - name: Summary
+        if: always() && steps.draft-release.outputs.tag != ''
+        env:
+          TAG: ${{ steps.draft-release.outputs.tag }}
+          DRAFT: ${{ needs.plan.outputs.draft }}
+          ARROXY_REF: ${{ needs.plan.outputs.arroxy_ref }}
+          ARROXY_SHA: ${{ needs.plan.outputs.arroxy_sha }}
+        run: |
           {
-            echo "Published $TAG"
+            if [ "$DRAFT" = true ]; then
+              echo "Created draft $TAG (not published) from Arroxy $ARROXY_REF ($ARROXY_SHA)"
+            else
+              echo "Published $TAG from Arroxy $ARROXY_REF ($ARROXY_SHA)"
+            fi
             echo
-            for name in $ASSETS; do
+            for name in $RUNTIME_INDEX_FILES; do
               echo "- $name"
             done
           } >> "$GITHUB_STEP_SUMMARY"
